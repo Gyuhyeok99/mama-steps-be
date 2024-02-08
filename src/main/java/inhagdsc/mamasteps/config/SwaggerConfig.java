@@ -24,6 +24,7 @@ public class SwaggerConfig implements WebMvcConfigurer {
                 .pathsToMatch("/**")
                 .build();
     }
+
     @Bean
     public OpenAPI OpenApi() {
 
