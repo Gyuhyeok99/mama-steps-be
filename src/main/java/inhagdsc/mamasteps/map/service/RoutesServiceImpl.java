@@ -7,6 +7,7 @@ import inhagdsc.mamasteps.map.dto.requestProfile.EditRequestProfileResponse;
 import inhagdsc.mamasteps.map.dto.requestProfile.GetRequestProfileResponse;
 import inhagdsc.mamasteps.map.dto.route.ComputeRoutesResponse;
 import inhagdsc.mamasteps.map.dto.route.SaveRouteRequest;
+import inhagdsc.mamasteps.map.repository.ComputingRouteRepository;
 import inhagdsc.mamasteps.map.repository.RouteRepository;
 import inhagdsc.mamasteps.map.repository.RouteRequestProfileRepository;
 import inhagdsc.mamasteps.map.service.regional.GoogleApiService;
@@ -19,10 +20,8 @@ import inhagdsc.mamasteps.user.entity.User;
 import inhagdsc.mamasteps.user.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
@@ -35,22 +34,24 @@ public class RoutesServiceImpl implements RoutesService {
     private int NUMBER_OF_RESULTS;
     @Value("${DISTANCE_FACTOR_OPTIMIZE-NUMBER_OF_SAMPLES}")
     private int NUMBER_OF_SAMPLES;
-    private final Environment env;
-    private final WebClient.Builder webClientBuilder;
     private final WaypointGenerator waypointGenerator;
     private final RouteRepository routeRepository;
+    private final ComputingRouteRepository computingRouteRepository;
     private final RouteRequestProfileRepository routeRequestProfileRepository;
     private final UserRepository userRepository;
+    private final GoogleApiService googleApiService;
+    private final TmapApiService tmapApiService;
     private final PolylineEncoder polylineEncoder;
 
     @Autowired
-    public RoutesServiceImpl(Environment env, WebClient.Builder webClientBuilder, WaypointGenerator waypointGenerator, RouteRepository routeRepository, RouteRequestProfileRepository routeRequestProfileRepository, UserRepository userRepository, PolylineEncoder polylineEncoder) {
-        this.env = env;
-        this.webClientBuilder = webClientBuilder;
+    public RoutesServiceImpl(WaypointGenerator waypointGenerator, RouteRepository routeRepository, ComputingRouteRepository computingRouteRepository, RouteRequestProfileRepository routeRequestProfileRepository, UserRepository userRepository, GoogleApiService googleApiService, TmapApiService tmapApiService, PolylineEncoder polylineEncoder) {
         this.waypointGenerator = waypointGenerator;
         this.routeRepository = routeRepository;
+        this.computingRouteRepository = computingRouteRepository;
         this.routeRequestProfileRepository = routeRequestProfileRepository;
         this.userRepository = userRepository;
+        this.googleApiService = googleApiService;
+        this.tmapApiService = tmapApiService;
         this.polylineEncoder = polylineEncoder;
     }
 
@@ -204,10 +205,26 @@ public class RoutesServiceImpl implements RoutesService {
     }
 
     @Override
+    @Transactional
     public List<ComputeRoutesResponse> computeRoutes(Long userId) throws IOException {
+        List<ComputeRoutesResponse> result = new ArrayList<>();
+
+        List<RouteEntity> computedRoutes = computingRouteRepository.findAllByUserId(userId);
+        if (!computedRoutes.isEmpty()) {
+            RouteEntity computedRoute = computedRoutes.get(0);
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+            if (!LocalDateTime.parse(computedRoute.getCreatedAt(), formatter).isBefore(LocalDateTime.now().minusSeconds(1))) {
+                for (RouteEntity route : computedRoutes) {
+                    result.add(new ComputeRoutesResponse(route));
+                }
+                return result;
+            }
+            computingRouteRepository.deleteAllByUserId(userId);
+        }
+
         RouteRequestProfileEntity requestProfileEntity = routeRequestProfileRepository.findByUserId(userId).get();
         RegionalRouteApiService apiService = choiceApiService(requestProfileEntity.getOrigin());
-        List<ComputeRoutesResponse> result = new ArrayList<>();
+
         try {
             for (; result.size() < NUMBER_OF_RESULTS; ) {
                 List<LatLng> waypointCandidates = LatLng.deepCopyList(requestProfileEntity.getCreatedWaypointCandidates());
@@ -249,6 +266,11 @@ public class RoutesServiceImpl implements RoutesService {
 
                     requestProfileEntity.getCreatedWaypointCandidates().remove(waypoint);
                     result.add(new ComputeRoutesResponse(route));
+
+                    route.setCreatedAt(LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+                    User user = requestProfileEntity.getUser();
+                    route.setUser(user);
+                    computingRouteRepository.save(route);
 
                     if (result.size() >= NUMBER_OF_RESULTS) {
                         break;
@@ -335,9 +357,9 @@ public class RoutesServiceImpl implements RoutesService {
 
     private RegionalRouteApiService choiceApiService(LatLng origin) {
         if ((origin.getLatitude() > 33 && origin.getLatitude() < 39) && (origin.getLongitude() > 124 && origin.getLongitude() < 132)) {
-            return new TmapApiService(env, webClientBuilder);
+            return tmapApiService;
         } else {
-            return new GoogleApiService(env, webClientBuilder);
+            return googleApiService;
         }
     }
 
