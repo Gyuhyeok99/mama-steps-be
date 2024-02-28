@@ -7,6 +7,7 @@ import inhagdsc.mamasteps.map.dto.requestProfile.EditRequestProfileResponse;
 import inhagdsc.mamasteps.map.dto.requestProfile.GetRequestProfileResponse;
 import inhagdsc.mamasteps.map.dto.route.ComputeRoutesResponse;
 import inhagdsc.mamasteps.map.dto.route.SaveRouteRequest;
+import inhagdsc.mamasteps.map.repository.ComputingRouteRepository;
 import inhagdsc.mamasteps.map.repository.RouteRepository;
 import inhagdsc.mamasteps.map.repository.RouteRequestProfileRepository;
 import inhagdsc.mamasteps.map.service.regional.GoogleApiService;
@@ -19,10 +20,8 @@ import inhagdsc.mamasteps.user.entity.User;
 import inhagdsc.mamasteps.user.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
@@ -33,21 +32,27 @@ import java.util.*;
 public class RoutesServiceImpl implements RoutesService {
     @Value("${WAYPOINT_GENERATOR_NUMBER_OF_RESULTS}")
     private int NUMBER_OF_RESULTS;
-    private final Environment env;
-    private final WebClient.Builder webClientBuilder;
+    @Value("${DISTANCE_FACTOR_OPTIMIZE-NUMBER_OF_SAMPLES}")
+    private int NUMBER_OF_SAMPLES;
     private final WaypointGenerator waypointGenerator;
     private final RouteRepository routeRepository;
+    private final ComputingRouteRepository computingRouteRepository;
     private final RouteRequestProfileRepository routeRequestProfileRepository;
     private final UserRepository userRepository;
+    private final GoogleApiService googleApiService;
+    private final TmapApiService tmapApiService;
+    private final PolylineEncoder polylineEncoder;
 
     @Autowired
-    public RoutesServiceImpl(Environment env, WebClient.Builder webClientBuilder, WaypointGenerator waypointGenerator, RouteRepository routeRepository, RouteRequestProfileRepository routeRequestProfileRepository, UserRepository userRepository) {
-        this.env = env;
-        this.webClientBuilder = webClientBuilder;
+    public RoutesServiceImpl(WaypointGenerator waypointGenerator, RouteRepository routeRepository, ComputingRouteRepository computingRouteRepository, RouteRequestProfileRepository routeRequestProfileRepository, UserRepository userRepository, GoogleApiService googleApiService, TmapApiService tmapApiService, PolylineEncoder polylineEncoder) {
         this.waypointGenerator = waypointGenerator;
         this.routeRepository = routeRepository;
+        this.computingRouteRepository = computingRouteRepository;
         this.routeRequestProfileRepository = routeRequestProfileRepository;
         this.userRepository = userRepository;
+        this.googleApiService = googleApiService;
+        this.tmapApiService = tmapApiService;
+        this.polylineEncoder = polylineEncoder;
     }
 
     @Override
@@ -72,6 +77,9 @@ public class RoutesServiceImpl implements RoutesService {
             List<LatLng> createdWaypoints;
             try {
                 createdWaypoints = waypointGenerator.getSurroundingWaypoints(existingProfile);
+                existingProfile.setCreatedWaypointCandidates(createdWaypoints);
+                optimizeDistanceFactor(existingProfile, NUMBER_OF_SAMPLES);
+                createdWaypoints = waypointGenerator.getSurroundingWaypoints(existingProfile);
             } catch (IllegalArgumentException e) {
                 createdWaypoints = new ArrayList<>(List.of(existingProfile.getOrigin()));
             }
@@ -91,6 +99,9 @@ public class RoutesServiceImpl implements RoutesService {
 
             List<LatLng> createdWaypoints;
             try {
+                createdWaypoints = waypointGenerator.getSurroundingWaypoints(existingProfile);
+                existingProfile.setCreatedWaypointCandidates(createdWaypoints);
+                optimizeDistanceFactor(existingProfile, NUMBER_OF_SAMPLES);
                 createdWaypoints = waypointGenerator.getSurroundingWaypoints(existingProfile);
             } catch (IllegalArgumentException e) {
                 createdWaypoints = new ArrayList<>(List.of(existingProfile.getOrigin()));
@@ -119,6 +130,9 @@ public class RoutesServiceImpl implements RoutesService {
         List<LatLng> createdWaypoints;
         try {
             createdWaypoints = waypointGenerator.getSurroundingWaypoints(requestProfileEntity);
+            requestProfileEntity.setCreatedWaypointCandidates(createdWaypoints);
+            optimizeDistanceFactor(requestProfileEntity, NUMBER_OF_SAMPLES);
+            createdWaypoints = waypointGenerator.getSurroundingWaypoints(requestProfileEntity);
         } catch (IllegalArgumentException e) {
             createdWaypoints = new ArrayList<>(List.of(requestProfileEntity.getOrigin()));
         }
@@ -139,11 +153,11 @@ public class RoutesServiceImpl implements RoutesService {
 
     @Override
     @Transactional
-    public void saveRoute(Long userId, SaveRouteRequest request) {
+    public void saveRoute(User user, SaveRouteRequest request) {
         RouteEntity routeEntity = new RouteEntity();
-        int routeCount = routeRepository.countByUserId(userId);
+        int routeCount = routeRepository.countByUserId(user.getId());
         routeEntity.setRouteName("내 산책 경로 " + (routeCount + 1));
-        routeEntity.setUserId(userId);
+        routeEntity.setUser(user);
         routeEntity.setPolyLine(request.getPolyLine());
         routeEntity.setTotalDistanceMeters(request.getTotalDistanceMeters());
         routeEntity.setTotalTimeSeconds(request.getTotalTimeSeconds());
@@ -191,10 +205,26 @@ public class RoutesServiceImpl implements RoutesService {
     }
 
     @Override
+    @Transactional
     public List<ComputeRoutesResponse> computeRoutes(Long userId) throws IOException {
+        List<ComputeRoutesResponse> result = new ArrayList<>();
+
+        List<RouteEntity> computedRoutes = computingRouteRepository.findAllByUserId(userId);
+        if (!computedRoutes.isEmpty()) {
+            RouteEntity computedRoute = computedRoutes.get(0);
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+            if (!LocalDateTime.parse(computedRoute.getCreatedAt(), formatter).isBefore(LocalDateTime.now().minusSeconds(1))) {
+                for (RouteEntity route : computedRoutes) {
+                    result.add(new ComputeRoutesResponse(route));
+                }
+                return result;
+            }
+            computingRouteRepository.deleteAllByUserId(userId);
+        }
+
         RouteRequestProfileEntity requestProfileEntity = routeRequestProfileRepository.findByUserId(userId).get();
         RegionalRouteApiService apiService = choiceApiService(requestProfileEntity.getOrigin());
-        List<ComputeRoutesResponse> result = new ArrayList<>();
+
         try {
             for (; result.size() < NUMBER_OF_RESULTS; ) {
                 List<LatLng> waypointCandidates = LatLng.deepCopyList(requestProfileEntity.getCreatedWaypointCandidates());
@@ -203,7 +233,7 @@ public class RoutesServiceImpl implements RoutesService {
                     throw new RuntimeException("No waypoints available");
                 }
 
-                List<LatLng> selectedWaypoints = selectWaypoints(waypointCandidates, NUMBER_OF_RESULTS);
+                List<LatLng> selectedWaypoints = selectRandomWaypoints(waypointCandidates, NUMBER_OF_RESULTS);
                 for (LatLng waypoint : selectedWaypoints) {
                     RouteRequestProfileEntity copiedProfileEntity = new RouteRequestProfileEntity();
                     copiedProfileEntity.setTargetTime(requestProfileEntity.getTargetTime());
@@ -215,22 +245,32 @@ public class RoutesServiceImpl implements RoutesService {
                     RouteEntity route = buildRouteFromParsedResponse(waypoint, apiService.getParsedApiResponse(copiedProfileEntity));
                     route.setTotalTimeSeconds(getPersonalRequiredTime(route.getTotalDistanceMeters(), requestProfileEntity.getWalkSpeed()));
 
-                    if (calculateDifferenceRatio(requestProfileEntity.getTargetTime(), route.getTotalTimeSeconds()) > 0.1) {
+                    double differenceRatio = calculateDifferenceRatio(requestProfileEntity.getTargetTime(), route.getTotalTimeSeconds());
+                    if (differenceRatio > 0.1) {
+                        LatLng pulledWaypoint;
                         if (requestProfileEntity.getTargetTime() > route.getTotalTimeSeconds()) {
-                            requestProfileEntity.setDistanceFactor(requestProfileEntity.getDistanceFactor() * 1.1);
+                            pulledWaypoint = pullWaypointToTarget(waypoint, requestProfileEntity.getOrigin(), differenceRatio + 1);
                         } else {
-                            requestProfileEntity.setDistanceFactor(requestProfileEntity.getDistanceFactor() * 0.9);
+                            pulledWaypoint = pullWaypointToTarget(waypoint, requestProfileEntity.getOrigin(), 1 / (differenceRatio + 1));
                         }
-                        try {
-                            requestProfileEntity.setCreatedWaypointCandidates(waypointGenerator.getSurroundingWaypoints(requestProfileEntity));
-                        } catch (IllegalArgumentException e) {
-                            return new ArrayList<>(List.of(new ComputeRoutesResponse(route)));
+                        copiedProfileEntity.getStartCloseWaypoints().remove(copiedProfileEntity.getStartCloseWaypoints().size() - 1);
+                        copiedProfileEntity.getStartCloseWaypoints().add(pulledWaypoint);
+                        route = buildRouteFromParsedResponse(pulledWaypoint, apiService.getParsedApiResponse(copiedProfileEntity));
+                        route.setTotalTimeSeconds(getPersonalRequiredTime(route.getTotalDistanceMeters(), requestProfileEntity.getWalkSpeed()));
+                        if (calculateDifferenceRatio(requestProfileEntity.getTargetTime(), route.getTotalTimeSeconds()) > 0.1) {
+                            // try pull only once
+                            requestProfileEntity.getCreatedWaypointCandidates().remove(waypoint);
+                            continue;
                         }
-                        continue;
                     }
 
                     requestProfileEntity.getCreatedWaypointCandidates().remove(waypoint);
                     result.add(new ComputeRoutesResponse(route));
+
+                    route.setCreatedAt(LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+                    User user = requestProfileEntity.getUser();
+                    route.setUser(user);
+                    computingRouteRepository.save(route);
 
                     if (result.size() >= NUMBER_OF_RESULTS) {
                         break;
@@ -247,11 +287,50 @@ public class RoutesServiceImpl implements RoutesService {
         return result;
     }
 
+    private void optimizeDistanceFactor(RouteRequestProfileEntity profile, int numberOfSamples) {
+        RegionalRouteApiService apiService = choiceApiService(profile.getOrigin());
+
+        List<LatLng> samples = new ArrayList<>();
+        if (profile.getCreatedWaypointCandidates().size() <= numberOfSamples) {
+            samples = new ArrayList<>(profile.getCreatedWaypointCandidates());
+        }
+        if (profile.getCreatedWaypointCandidates().size() > numberOfSamples) {
+            samples = selectUniformWaypoints(profile.getCreatedWaypointCandidates(), numberOfSamples);
+        }
+
+        int sumOfTimeOfSamples = 0;
+        for (LatLng sample : samples) {
+            RouteRequestProfileEntity copiedProfileEntity = new RouteRequestProfileEntity();
+            copiedProfileEntity.setTargetTime(profile.getTargetTime());
+            copiedProfileEntity.setOrigin(profile.getOrigin().clone());
+            copiedProfileEntity.setStartCloseWaypoints(LatLng.deepCopyList(profile.getStartCloseWaypoints()));
+            copiedProfileEntity.setEndCloseWaypoints(LatLng.deepCopyList(profile.getEndCloseWaypoints()));
+            copiedProfileEntity.getStartCloseWaypoints().add(sample);
+
+            try {
+                RouteEntity route = buildRouteFromParsedResponse(sample, apiService.getParsedApiResponse(copiedProfileEntity));
+                route.setTotalTimeSeconds(getPersonalRequiredTime(route.getTotalDistanceMeters(), profile.getWalkSpeed()));
+                sumOfTimeOfSamples += route.getTotalTimeSeconds();
+            } catch (IOException e) {
+                continue;
+            }
+        }
+        double averageTimeOfSamples = (double) sumOfTimeOfSamples / samples.size();
+
+        profile.setDistanceFactor(profile.getDistanceFactor() * (profile.getTargetTime() / averageTimeOfSamples));
+    }
+
+    private LatLng pullWaypointToTarget(LatLng waypoint, LatLng origin, double ratio) {
+        double latitude = origin.getLatitude() + (waypoint.getLatitude() - origin.getLatitude()) * ratio;
+        double longitude = origin.getLongitude() + (waypoint.getLongitude() - origin.getLongitude()) * ratio;
+        return new LatLng(latitude, longitude);
+    }
+
     private double calculateDifferenceRatio(double standard, double value) {
         return Math.abs(standard - value) / standard;
     }
 
-    private List<LatLng> selectWaypoints(List<LatLng> waypoints, int number) {
+    private List<LatLng> selectRandomWaypoints(List<LatLng> waypoints, int number) {
         if (waypoints.size() <= number) {
             return new ArrayList<>(waypoints);
         }
@@ -263,17 +342,30 @@ public class RoutesServiceImpl implements RoutesService {
         return selectedWaypoints;
     }
 
+    private List<LatLng> selectUniformWaypoints(List<LatLng> waypoints, int number) {
+        if (waypoints.size() <= number) {
+            return new ArrayList<>(waypoints);
+        }
+
+        List<LatLng> selectedWaypoints = new ArrayList<>();
+        int interval = waypoints.size() / number;
+        for (int i = 0; i < number; i++) {
+            selectedWaypoints.add(waypoints.get(i * interval));
+        }
+        return selectedWaypoints;
+    }
+
     private RegionalRouteApiService choiceApiService(LatLng origin) {
         if ((origin.getLatitude() > 33 && origin.getLatitude() < 39) && (origin.getLongitude() > 124 && origin.getLongitude() < 132)) {
-            return new TmapApiService(env, webClientBuilder);
+            return tmapApiService;
         } else {
-            return new GoogleApiService(env, webClientBuilder);
+            return googleApiService;
         }
     }
 
     private RouteEntity buildRouteFromParsedResponse(LatLng createdWaypoint, ObjectNode coordinates) throws IOException {
 
-        String polyline = new PolylineEncoder().encode(coordinates.path("coordinates"));
+        String polyline = polylineEncoder.encode(coordinates.path("coordinates"));
         int totalTimeSeconds = coordinates.path("totalTimeSeconds").asInt();
         double totalDistanceMeters = coordinates.path("totalDistanceMeters").asDouble();
 

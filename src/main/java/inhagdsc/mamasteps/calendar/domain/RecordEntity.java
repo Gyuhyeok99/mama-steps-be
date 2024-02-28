@@ -1,11 +1,18 @@
 package inhagdsc.mamasteps.calendar.domain;
 
 import inhagdsc.mamasteps.calendar.dto.RecordDto;
+import inhagdsc.mamasteps.map.domain.RouteEntity;
+import inhagdsc.mamasteps.user.entity.User;
 import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
 
 import java.time.LocalDateTime;
+import java.util.Optional;
 
 @Entity
+@Getter
+@Setter
 @Table(name = "records")
 public class RecordEntity {
 
@@ -14,11 +21,13 @@ public class RecordEntity {
     @Column(name = "record_id", nullable = false)
     private Long id;
 
-    @Column(name = "user_id", nullable = false)
-    private Long userId;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
 
-    @Column(name = "route_id", nullable = true)
-    private Long routeId;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "route_id", nullable = true)
+    private RouteEntity route;
 
     @Column(name = "start-at")
     private LocalDateTime startAt;
@@ -35,7 +44,11 @@ public class RecordEntity {
     public RecordDto toDto() {
         RecordDto dto = new RecordDto();
         dto.setId(this.getId());
-        dto.setRouteId(this.getRouteId());
+        Optional.ofNullable(this.getRoute())
+                .map(RouteEntity::getId)
+                .ifPresent(routeId -> {
+                    dto.setRouteId(this.getRoute().getId());
+                });
         dto.setDate(this.getStartAt());
         dto.setCompletedTimeSeconds(this.getCompletedTimeSeconds());
         dto.setCreatedAt(this.getCreatedAt());
@@ -44,65 +57,9 @@ public class RecordEntity {
     }
 
     public void update(RecordEntity recordEntity) {
-        this.routeId = recordEntity.getRouteId();
+        this.route = recordEntity.getRoute();
         this.startAt = recordEntity.getStartAt();
         this.completedTimeSeconds = recordEntity.getCompletedTimeSeconds();
         this.updatedAt = recordEntity.getUpdatedAt();
-    }
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public Long getUserId() {
-        return userId;
-    }
-
-    public void setUserId(Long userId) {
-        this.userId = userId;
-    }
-
-    public LocalDateTime getStartAt() {
-        return startAt;
-    }
-
-    public void setStartAt(LocalDateTime date) {
-        this.startAt = date;
-    }
-
-    public String getCreatedAt() {
-        return createdAt;
-    }
-
-    public void setCreatedAt(String createdAt) {
-        this.createdAt = createdAt;
-    }
-
-    public String getUpdatedAt() {
-        return updatedAt;
-    }
-
-    public void setUpdatedAt(String updatedAt) {
-        this.updatedAt = updatedAt;
-    }
-
-    public Long getRouteId() {
-        return routeId;
-    }
-
-    public void setRouteId(Long routeId) {
-        this.routeId = routeId;
-    }
-
-    public int getCompletedTimeSeconds() {
-        return completedTimeSeconds;
-    }
-
-    public void setCompletedTimeSeconds(int completedTimeSeconds) {
-        this.completedTimeSeconds = completedTimeSeconds;
     }
 }
